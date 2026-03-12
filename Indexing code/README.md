@@ -1,5 +1,8 @@
 # SPARQL-to-SHACL Pattern Extractor & Generator
 
+TODO:
+* Make it work with TPF server (using my code), and RDF dumps
+
 **A simple Ruby tool that discovers data patterns from one or more SPARQL endpoints and generates basic [SHACL](https://www.w3.org/TR/shacl/) shapes.**
 
 This script performs lightweight schema mining by:
