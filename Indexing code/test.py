@@ -25,7 +25,7 @@ engine = Engine()
 # ]
 
 endpoints = [
-    "http://localhost:9999/blazegraph/namespace/caresm/sparql"
+    "http://localhost:9999/blazegraph/namespace/kegg/sparql"
 ]
 
 

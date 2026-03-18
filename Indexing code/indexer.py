@@ -3,7 +3,7 @@ import os
 import re
 from urllib.parse import urlparse
 from SPARQLWrapper import SPARQLWrapper, JSON
-
+from adapters.factory import AdapterFactory
 
 # ==============================
 # SPO Pattern Container
@@ -194,81 +194,61 @@ class Engine:
     # --------------------------------------------------
     # Extract patterns
     # --------------------------------------------------
-    def extract_patterns(self, endpoint_URLs):
+    def extract_patterns(self, sources, mode="sparql"):
 
         self.endpoint_patterns = {}
+        print(f"\n[Engine] Starting pattern extraction")
+        print(f"          → Mode: {mode.upper()}")
+        print(f"          → Sources: {len(sources)} endpoint(s)")
+        for src in sources:
+            print(f"            - {src}")
 
-        for endpoint_URL in endpoint_URLs:
+        for source in sources:
 
-            print(f"\n=== Extracting patterns from {endpoint_URL} ===")
+            adapter = AdapterFactory.create(source, mode, self)
 
-            self.detect_named_graphs(endpoint_URL)
+            # ⚠️ pass engine only for SPARQL
+            if mode == "sparql":
+                adapter.engine = self
 
             self.patterns = {}
             self.hashed_patterns = set()
 
-            types = []
-
-            print(" [Engine] Phase 1: exploratory type scan...")
-
-            results = self.query_endpoint(endpoint_URL, "exploratory")
-
-            for sol in results:
-
-                t = sol.get("type", {}).get("value")
-
-                if not t:
-                    continue
-
-                if re.search(r"openlink|w3\.org", t):
-                    continue
-
-                if t not in types:
-                    types.append(t)
+            print("\n[Engine] Phase 1: exploratory scan...")
+            types = adapter.exploratory_types()
 
             print(f" → Detected {len(types)} classes.")
 
-            print(" [Engine] Phase 2: type expansion...")
+            print("[Engine] Phase 2: expansion...")
 
-            for type_ in types:
+            from concurrent.futures import ThreadPoolExecutor
 
-                # Outgoing properties
-                for sol in self.query_endpoint(endpoint_URL, "fixed_subject", type_):
+            def process_type(type_):
+
+                # outgoing
+                for sol in adapter.outgoing_patterns(type_):
 
                     g = sol.get("g", {}).get("value", "urn:default-graph")
-
-                    subj_type = sol.get("subject_type", {}).get("value", "").strip()
-
-                    if subj_type and subj_type != type_:
-                        if not self.in_database(type_, self.RDF_TYPE, subj_type, g):
-                            self.add_triple_pattern(type_, type_, self.RDF_TYPE, subj_type, g)
-
-                    p = sol.get("predicate", {}).get("value", "").strip()
-                    o = sol.get("object_type", {}).get("value", "").strip()
-
-                    if not p:
-                        continue
+                    p = sol.get("predicate", {}).get("value", "")
+                    o = sol.get("object_type", {}).get("value", "")
 
                     if not self.in_database(type_, p, o, g):
                         self.add_triple_pattern(type_, type_, p, o, g)
 
-                # Incoming properties
-                for sol in self.query_endpoint(endpoint_URL, "fixed_object", type_):
+                # incoming
+                for sol in adapter.incoming_patterns(type_):
 
-                    s = sol.get("subject_type", {}).get("value", "").strip()
-                    p = sol.get("predicate", {}).get("value", "").strip()
+                    s = sol.get("subject_type", {}).get("value", "")
+                    p = sol.get("predicate", {}).get("value", "")
                     g = sol.get("g", {}).get("value", "urn:default-graph")
-
-                    if not s or not p:
-                        continue
 
                     if not self.in_database(s, p, type_, g):
                         self.add_triple_pattern(type_, s, p, type_, g)
 
-            total = sum(len(v) for v in self.patterns.values())
-            print(f" → Total patterns extracted: {total}")
+            with ThreadPoolExecutor(max_workers=6) as pool:
+                pool.map(process_type, types)
 
-            self.endpoint_patterns[endpoint_URL] = self.patterns
+            self.endpoint_patterns[source] = self.patterns
 
         return self.endpoint_patterns
 
