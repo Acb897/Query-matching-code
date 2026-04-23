@@ -90,6 +90,8 @@ class Engine:
         if not p:
             return
 
+        if not s or not s.startswith("http"):
+            return
         if p == self.RDF_TYPE and not o:
             return
 

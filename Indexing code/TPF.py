@@ -19,7 +19,6 @@ import requests
 import threading
 from urllib.parse import urlencode, urljoin
 from concurrent.futures import ThreadPoolExecutor
-
 from bs4 import BeautifulSoup
 
 from rdflib import ConjunctiveGraph, Graph, URIRef, Literal, Variable
@@ -28,6 +27,8 @@ from rdflib.plugins.sparql import prepareQuery
 from rdflib.plugins.sparql.parserutils import Expr
 from rdflib.plugins.sparql.parser import parseQuery
 from rdflib.plugins.sparql.algebra import translateQuery
+import time
+import queue
 
 HYDRA = Namespace("http://www.w3.org/ns/hydra/core#")
 VOID = Namespace("http://rdfs.org/ns/void#")
@@ -36,78 +37,104 @@ VOID = Namespace("http://rdfs.org/ns/void#")
 # GLOBAL SETTINGS
 # -------------------------------------------------------------------------
 
-MAX_THREADS = 8
-BIND_BATCH_SIZE = 20
-
+MAX_THREADS = 3
+BIND_BATCH_SIZE = MAX_THREADS * 5
+MAX_BUFFER_BYTES   = 10_000_000  # ~10MB safety cap
+FLUSH_INTERVAL     = 5           # seconds
 _cache_lock = threading.Lock()
-_repo_lock  = threading.Lock()
 page_cache = {}
+_repo_lock  = threading.Lock()
+_parse_lock = threading.Lock()
+
+BUFFER_QUEUE_MAXSIZE = 100_000  # prevents memory explosion
+_ingest_queue = queue.Queue(maxsize=BUFFER_QUEUE_MAXSIZE)
 
 INDEXING_MODE = False
 ALLOW_PARTIAL = True
+
 # -------------------------------------------------------------------------
 # SPARQL ALGEBRA PARSING
 # -------------------------------------------------------------------------
 
-def extract_all_patterns(node, patterns=None):
+def extract_all_patterns(node, patterns=None, graph_term=None):
+    """
+    Recursively walk the SPARQL algebra tree.
+    - graph_term is propagated into BGP triples when inside a GRAPH block.
+    - Handles both TPF (no graph) and QPF (GRAPH ?g / GRAPH <uri>) queries.
+    """
     if patterns is None:
         patterns = []
 
     if node is None:
         return patterns
 
-    # If node has .triples attribute (BGP)
-    if hasattr(node, "triples") and node.triples:
-        patterns.extend(node.triples)
+    node_name = getattr(node, "name", None)
 
-    # Recurse over common attributes
-    for attr in ["p", "p1", "p2", "args", "graph"]:
+    # BGP node: contains the actual triples
+    if node_name == "BGP":
+        if node.triples:
+            for s, p, o in node.triples:
+                patterns.append({
+                    "subject":   s,
+                    "predicate": p,
+                    "object":    o,
+                    "graph":     graph_term,  # None unless inside GRAPH block
+                })
+        return patterns
+
+    # GRAPH node: sets the graph context for everything inside it
+    if node_name == "Graph":
+        inner_graph_term = getattr(node, "term", None)
+        # node.p holds the inner algebra (usually a BGP)
+        if hasattr(node, "p"):
+            extract_all_patterns(node.p, patterns, graph_term=inner_graph_term)
+        return patterns
+
+    # All other nodes: recurse over known child attributes
+    for attr in ["p", "p1", "p2", "args", "expr", "BGP", "Join", "LeftJoin", "Union", "Project", "Filter"]:
         if hasattr(node, attr):
             child = getattr(node, attr)
             if isinstance(child, list):
                 for c in child:
-                    extract_all_patterns(c, patterns)
-            else:
-                extract_all_patterns(child, patterns)
+                    extract_all_patterns(c, patterns, graph_term)
+            elif child is not None:
+                extract_all_patterns(child, patterns, graph_term)
 
     return patterns
 
-def transform(query):
-    try:
+
+def transform(query: str):
+    with _parse_lock:   # <--- THIS IS THE KEY
         try:
             parsed = parseQuery(query)
+            algebra = translateQuery(parsed).algebra
+            raw_patterns = extract_all_patterns(algebra)
         except Exception as e:
-            print("SPARQL parse error (query):")
-            print(query)
-            print(e)
-            return []
-        algebra = translateQuery(parsed)
-        if not hasattr(algebra, "algebra") or algebra.algebra is None:
-            print("WARNING: translateQuery returned empty algebra")
-            return []
-        triples = extract_all_patterns(algebra.algebra)
-    except Exception as e:
-        print("SPARQL parse error:", e)
-        return []
+            print(f"SPARQL parse error: {e}")
 
+    # The rest of the function (term_to_str, deduplication, etc.) stays outside the lock
     def term_to_str(term):
+        if term is None:
+            return None
         if isinstance(term, Variable):
-            return f"?{term}"   # <-- preserve the ? prefix
+            return f"?{term}"
         return str(term)
 
-    # Deduplicate
     seen = set()
     bgp = []
-    for s, p, o in triples:
-        key = (term_to_str(s), term_to_str(p), term_to_str(o))
+    for pat in raw_patterns:
+        entry = {
+            "subject": term_to_str(pat.get("subject")),
+            "predicate": term_to_str(pat.get("predicate")),
+            "object": term_to_str(pat.get("object")),
+            "graph": term_to_str(pat.get("graph"))
+        }
+        key = (entry["subject"], entry["predicate"], entry["object"], entry["graph"])
         if key not in seen:
             seen.add(key)
-            bgp.append({
-                "subject":   term_to_str(s),
-                "predicate": term_to_str(p),
-                "object":    term_to_str(o),
-            })
-    print("DEBUG: extracted triple patterns:", bgp)
+            bgp.append(entry)
+
+    print("DEBUG: extracted quad patterns:", bgp)
     return bgp
 
 # -------------------------------------------------------------------------
@@ -115,20 +142,14 @@ def transform(query):
 # -------------------------------------------------------------------------
 
 def extract_vars_from_pattern(pat):
+    vars_ = []
 
-    vars = []
+    for field in ("subject", "predicate", "object", "graph"):
+        val = pat.get(field)
+        if val and val.startswith("?"):
+            vars_.append(val[1:])
 
-    if pat["subject"].startswith("?"):
-        vars.append(pat["subject"][1:])
-
-    if pat["predicate"].startswith("?"):
-        vars.append(pat["predicate"][1:])
-
-    if pat["object"].startswith("?"):
-        vars.append(pat["object"][1:])
-
-    return vars
-
+    return vars_
 
 def shares_variable(pat, processed_patterns):
 
@@ -144,15 +165,34 @@ def shares_variable(pat, processed_patterns):
 # -------------------------------------------------------------------------
 # TPF URL BUILDER
 # -------------------------------------------------------------------------
-
-from urllib.parse import urlencode
-
-def tpf_uri_request_builder(control_uri, subject, predicate, object_):
+def triple_matches_request(s, p, o, req_s, req_p, req_o):
     """
-    Build a TPF request URL.
-    - Encodes URIs properly
-    - Skips variables (starting with ?)
-    - Returns full URL ready for fetch_tpf_page
+    Comunica-style triple filtering:
+    Only keep triples that match the requested triple pattern.
+    """
+
+    def match(req, val):
+        if req is None or req.startswith("?"):
+            return True
+
+        # Normalize <IRI>
+        if req.startswith("<") and req.endswith(">"):
+            req = req[1:-1]
+
+        return str(val) == req
+
+    return (
+        match(req_s, s) and
+        match(req_p, p) and
+        match(req_o, o)
+    )
+
+
+def tpf_uri_request_builder(control_uri, subject, predicate, object_, graph=None):
+    """
+    Build a TPF or QPF request URL.
+    Skips variables (starting with ?) and None values.
+    Includes graph parameter for QPF when provided.
     """
     params = {}
 
@@ -165,13 +205,12 @@ def tpf_uri_request_builder(control_uri, subject, predicate, object_):
     if object_ is not None and not object_.startswith("?"):
         params["object"] = object_
 
+    if graph is not None and not graph.startswith("?"):
+        params["graph"] = graph
+
     if params:
-        query = urlencode(params)
-        url = f"{control_uri}?{query}"
-        print("TPF URL:", url)
-        return url
-    else:
-        return control_uri
+        return f"{control_uri}?{urlencode(params)}"
+    return control_uri
 
 
 # -------------------------------------------------------------------------
@@ -194,14 +233,14 @@ def heuristic_cardinality(html):
     return 5000
 
 
-def get_pattern_count(control_uri, subject, predicate, object):
+def get_pattern_count(control_uri, subject, predicate, object_, graph=None):
 
-    url = tpf_uri_request_builder(control_uri, subject, predicate, object)
+    url = tpf_uri_request_builder(control_uri, subject, predicate, object_, graph)
 
     try:
         response = requests.get(url)
         html = response.text
-        content_type = response.headers.get("content-type","")
+        content_type = response.headers.get("content-type", "")
     except Exception as e:
         print("Connection failed:", url, e)
         return 999_999_999
@@ -209,32 +248,25 @@ def get_pattern_count(control_uri, subject, predicate, object):
     if "html" not in content_type and "<html" not in html:
         return heuristic_cardinality(html)
 
-    graph = Graph()
+    g = Graph()
     count = None
 
     try:
-        graph.parse(data=html, format="rdfa")
+        g.parse(data=html, format="rdfa")
     except:
         return heuristic_cardinality(html)
 
     for pred in [HYDRA.totalItems, VOID.triples]:
-
-        for s,p,o in graph:
-
+        for s, p, o in g:
             if p == pred:
-
-                raw = str(o).strip()
-                raw = re.sub(r'[,±~]', '', raw)
-
+                raw = re.sub(r'[,±~]', '', str(o).strip())
                 if raw.isdigit():
                     count = int(raw)
                     break
-
         if count:
             break
 
     return count if count else heuristic_cardinality(html)
-
 
 # -------------------------------------------------------------------------
 # PAGE FETCHING (WITH CACHE)
@@ -245,33 +277,89 @@ import requests
 
 page_cache = {}
 
+FOAF_PRIMARY_TOPIC = URIRef("http://xmlns.com/foaf/0.1/primaryTopic")
+METADATA_NAMESPACES = (
+    "http://www.w3.org/ns/hydra/core#",
+    "http://rdfs.org/ns/void#",
+)
+
+def _is_metadata_predicate(p):
+    return any(str(p).startswith(ns) for ns in METADATA_NAMESPACES)
+
+def _extract_data_and_meta(cg):
+    """
+    Primary strategy: exclude the graph that contains foaf:primaryTopic.
+    Returns (data_graph, meta_graph, strategy_used).
+    Falls back to predicate filtering if primaryTopic not found or yields no data.
+    """
+    # --- Strategy 1: graph-based exclusion via foaf:primaryTopic ---
+    metadata_graph_iris = set()
+    for s, p, o, ctx in cg.quads((None, FOAF_PRIMARY_TOPIC, None, None)):
+        metadata_graph_iris.add(ctx.identifier)
+
+    if metadata_graph_iris:
+        data_graph = Graph()
+        meta_graph = Graph()
+
+        for s, p, o, ctx in cg.quads((None, None, None, None)):
+            if ctx.identifier in metadata_graph_iris:
+                meta_graph.add((s, p, o))
+            else:
+                data_graph.add((s, p, o))
+
+        if len(data_graph) > 0:
+            print(f"  [Strategy] Graph exclusion via foaf:primaryTopic "
+                  f"({len(metadata_graph_iris)} metadata graph(s))")
+            return data_graph, meta_graph, "graph"
+        else:
+            print("  [Strategy] foaf:primaryTopic found but yielded 0 data triples, "
+                  "falling back to predicate filtering")
+
+    else:
+        print("  [Strategy] foaf:primaryTopic not found, "
+              "falling back to predicate filtering")
+
+    # --- Strategy 2: predicate namespace filtering (original behaviour) ---
+    data_graph = Graph()
+    meta_graph = Graph()
+
+    for s, p, o, ctx in cg.quads((None, None, None, None)):
+        if _is_metadata_predicate(p):
+            meta_graph.add((s, p, o))
+        else:
+            data_graph.add((s, p, o))
+
+    print(f"  [Strategy] Predicate filtering → {len(data_graph)} data triples")
+    return data_graph, meta_graph, "predicate"
+
+
 def fetch_tpf_page(url):
     """
-    Fetch and parse one TPF page.
-    Thread-safe: uses _cache_lock around cache reads/writes.
-    Returns a flattened rdflib.Graph.
+    Fetch and parse a TPF/QPF page.
+
+    Comunica-style:
+    - DO NOT separate metadata vs data
+    - Return full graph
+    - Metadata will be handled separately
     """
+
     with _cache_lock:
         if url in page_cache:
             return page_cache[url]
 
-    headers = {
-        "Accept": (
-            "text/turtle;q=1.0, application/trig;q=0.9, "
-            "application/rdf+xml;q=0.8, text/n3;q=0.7, "
-            "application/ld+json;q=0.6"
-        ),
-        "User-Agent": "TPF-Harvester/1.0",
-    }
+    headers = {"Accept": "application/trig, text/turtle;q=0.9"}
 
     cg = ConjunctiveGraph()
+
     try:
         resp = requests.get(url, headers=headers, timeout=15)
         resp.raise_for_status()
         text = resp.text
+
         print(f"[FETCH] {url} → {resp.status_code}, {len(text)} bytes")
 
-        for fmt in ["trig", "turtle", "nt", "xml", "rdfa", "json-ld"]:
+        # Try formats (same as before but cleaner intention)
+        for fmt in ["trig", "turtle", "nt", "xml", "json-ld", "rdfa"]:
             try:
                 cg.parse(data=text, format=fmt)
                 break
@@ -281,78 +369,76 @@ def fetch_tpf_page(url):
     except Exception as e:
         print(f"  Fetch/parse error: {e}")
 
-    flattened = Graph()
-    for s, p, o, _ctx in cg.quads((None, None, None, None)):
-        flattened.add((s, p, o))
-
     with _cache_lock:
-        page_cache[url] = flattened
+        page_cache[url] = cg
 
-    data_triples = [(s,p,o) for s,p,o in flattened 
-                    if not str(p).startswith("http://www.w3.org/ns/hydra/core#")
-                    and not str(p).startswith("http://rdfs.org/ns/void#")]
-    
-    print(f"  Page subjects: {set(str(s) for s,p,o in data_triples)}")
-    print(f"  Sample triples: {data_triples[:3]}")
+    return cg
 
-    return flattened
-
-def _next_page_from_graph(g, current_url):
-    """
-    Extract the hydra:nextPage / hydra:next URL from the parsed RDF graph.
-    This avoids a second HTTP request and works regardless of content type.
-    """
-    for next_pred in [
-        HYDRA.nextPage,
-        HYDRA.next,
-        URIRef("http://www.w3.org/ns/hydra/core#next"),
-    ]:
-        for s, p, o in g.triples((None, next_pred, None)):
+def _next_page_from_graph(meta_graph, current_url):
+    for next_pred in [HYDRA.nextPage, HYDRA.next,
+                      URIRef("http://www.w3.org/ns/hydra/core#next")]:
+        for s, p, o in meta_graph.triples((None, next_pred, None)):
             return str(o)
-
-    # Fallback: look for the paging metadata on the current page's control URI
-    # Some TPF servers use void:nextPage or a custom predicate
-    for s, p, o in g.triples((None, None, None)):
-        if "page=" in str(o) and str(o) != current_url:
-            # Only treat as next if it looks like an incremented page link
-            pass
-
     return None
 
 
-def harvest_pattern_into_repo(url, repo):
+def harvest_pattern_into_repo(url, named_graph,
+                              subject=None, predicate=None, object_=None):
     """
-    Paginate through all TPF pages for a given pattern URL.
-    - Uses a SINGLE HTTP request per page (no duplicate fetch).
-    - Extracts the next-page link from the RDF graph (hydra:nextPage).
-    - Thread-safe writes to repo via _repo_lock.
+    Harvest triples from a TPF/QPF endpoint for ONE triple pattern.
+
+    Comunica-style:
+    - Fetch full page
+    - Filter triples by triple pattern
+    - Ignore metadata implicitly (it won't match)
     """
+
     print("Harvesting URL:", url)
+
     current_url = url
     page_count = 0
 
     while current_url:
         page_count += 1
-        print(f"  Page {page_count}: {current_url}")
+        print(f" Page {page_count}: {current_url}")
 
-        g = fetch_tpf_page(current_url)
+        cg = fetch_tpf_page(current_url)
 
-        # Extract next-page link from the parsed graph, NOT a second HTTP request
-        next_url = _next_page_from_graph(g, current_url)
+        # --- Extract next page from metadata ---
+        next_url = None
+        items_per_page = None
 
+        for s, p, o in cg:
+            if p == HYDRA.next or p == HYDRA.nextPage:
+                next_url = str(o)
+
+            if p == HYDRA.itemsPerPage:
+                try:
+                    items_per_page = int(str(o))
+                except ValueError:
+                    pass
+
+        # --- Filter triples (THIS IS THE KEY CHANGE) ---
         data_triples = 0
-        with _repo_lock:
-            for triple in g:
-                # Skip hydra/void metadata triples — keep only data triples
-                s, p, o = triple
-                if str(p).startswith("http://www.w3.org/ns/hydra/core#"):
-                    continue
-                if str(p).startswith("http://rdfs.org/ns/void#"):
-                    continue
-                repo.add(triple)
+
+        for s, p, o, ctx in cg.quads((None, None, None, None)):
+
+            if triple_matches_request(s, p, o,
+                                      subject, predicate, object_):
+
+                add_to_buffer((s, p, o), named_graph)
                 data_triples += 1
 
-        print(f"  Added {data_triples} data triples → repo total: {len(repo)}")
+        print(f"  Buffered {data_triples} matching triples")
+
+        # --- Stop conditions ---
+        if data_triples == 0:
+            print("  → No matching triples → end")
+            break
+
+        if items_per_page is not None and data_triples < items_per_page:
+            print(f"  → Partial page → last page")
+            break
 
         if next_url == current_url:
             print("  WARNING: next URL equals current URL, stopping.")
@@ -361,13 +447,16 @@ def harvest_pattern_into_repo(url, repo):
         current_url = next_url
 
 
+
+
 # -------------------------------------------------------------------------
 # VECTORISED BIND JOIN
 # -------------------------------------------------------------------------
 
-def fetch_binding(binding, pat, control_uri, repo):
+def fetch_binding(binding, pat, control_uri, named_graph):
+
     def concretize(term, binding):
-        if not term.startswith("?"):
+        if term is None or not term.startswith("?"):
             return term
         var_name = term[1:]
         if var_name not in binding:
@@ -382,25 +471,18 @@ def fetch_binding(binding, pat, control_uri, repo):
     s = concretize(pat["subject"],   binding)
     p = concretize(pat["predicate"], binding)
     o = concretize(pat["object"],    binding)
+    g = concretize(pat.get("graph"), binding)  # None if TPF
 
-    if None in (s, p, o):
-        return
-
-    url = tpf_uri_request_builder(control_uri, s, p, o)
-
-    with _repo_lock:
-        before = len(repo)
-
-    harvest_pattern_into_repo(url, repo)   # internally thread-safe now
-
-    with _repo_lock:
-        after = len(repo)
-
-    if after == before:
-        print("⚠️  Bind produced NO triples:", url)
+    url = tpf_uri_request_builder(control_uri, s, p, o, g)
+    harvest_pattern_into_repo(
+    url,
+    named_graph,
+    s,
+    p,
+    o)
 
 
-def fetch_binding_batch(batch, pat, control_uri, repo):
+def fetch_binding_batch(batch, pat, control_uri, named_graph):
 
     with ThreadPoolExecutor(MAX_THREADS) as pool:
 
@@ -408,7 +490,7 @@ def fetch_binding_batch(batch, pat, control_uri, repo):
 
         for binding in batch:
             futures.append(
-                pool.submit(fetch_binding, binding, pat, control_uri, repo)
+                pool.submit(fetch_binding, binding, pat, control_uri, named_graph)
             )
 
         for f in futures:
@@ -602,6 +684,75 @@ def extract_upstream_bindings(repo, current_idx, harvested, bgp):
 
     return unique
 
+
+def extract_upstream_bindings_graphdb(current_idx, harvested, bgp, graph_iri):
+
+    if not harvested:
+        return []
+
+    current_pat = bgp[current_idx]
+
+    current_vars = set(extract_vars_from_pattern(current_pat))
+
+    upstream_vars = set()
+    prev_patterns = [bgp[i] for i in harvested]
+
+    for p in prev_patterns:
+        upstream_vars.update(extract_vars_from_pattern(p))
+
+    join_vars = current_vars.intersection(upstream_vars)
+
+    if not join_vars:
+        return []
+
+    def safe(term):
+        if term.startswith("?"):
+            return term
+        if term.startswith("<"):
+            return term
+        if term.startswith('"'):
+            return term
+        if term.startswith("http"):
+            return f"<{term}>"
+        return f'"{term}"'
+
+    query = "SELECT " + " ".join("?" + v for v in join_vars) + " WHERE {\n"
+
+    if graph_iri:
+        query += f" GRAPH <{graph_iri}> {{\n"
+
+    for pat in prev_patterns:
+        s = safe(pat["subject"])
+        p = safe(pat["predicate"])
+        o = safe(pat["object"])
+        query += f" {s} {p} {o} .\n"
+
+    if graph_iri:
+        query += " }\n"
+
+    query += "}"
+
+    print("DEBUG GraphDB binding query:")
+    print(query)
+
+    try:
+        results = execute_sparql_query(query)
+        bindings = []
+
+        for row in results:
+            sol = {}
+            for v in join_vars:
+                if v in row:
+                    sol[v] = row[v]
+            if sol:
+                bindings.append(sol)
+
+        print("Bindings extracted from GraphDB:", len(bindings))
+        return bindings
+
+    except Exception as e:
+        print("GraphDB binding extraction failed:", e)
+        return []
 # -------------------------------------------------------------------------
 # INSERT INTO LOCAL TRIPLESTORE
 # -------------------------------------------------------------------------
@@ -631,28 +782,142 @@ INSERT DATA {{
 """
 
 
-def insert_query(query):
+# def insert_query(query):
+#     endpoint = "http://acb8computer:7200/repositories/test1/statements"
+
+#     try:
+#         r = requests.post(
+#             endpoint,
+#             data=query,
+#             headers={
+#                 "Content-Type":"application/sparql-update",
+#                 "Accept":"application/json"
+#             }
+#         )
+
+#         if r.status_code == 200 or r.status_code == 204:
+#             print("Bulk insert successful")
+#         else:
+#             print("Insert failed:", r.status_code, r.text)  # <- show server response
+
+#     except Exception as e:
+#         print("Insert error:", e)
+
+
+def insert_triples_stream(statements, named_graph=None):
+    """
+    Send triples directly to GraphDB as RDF (N-Triples), without SPARQL.
+    Much lower memory usage and faster ingestion.
+    """
+
     endpoint = "http://acb8computer:7200/repositories/test1/statements"
 
+    lines = []
+
+    for s, p, o in statements:
+        triple = f"{s.n3()} {p.n3()} {o.n3()} ."
+
+        # If using named graphs → use N-Quads format
+        if named_graph:
+            triple = f"{s.n3()} {p.n3()} {o.n3()} <{named_graph}> ."
+
+        lines.append(triple)
+
+    payload = "\n".join(lines)
+
+    headers = {
+        # IMPORTANT: switch format depending on named_graph
+        "Content-Type": "application/n-quads" if named_graph else "application/n-triples"
+    }
+
     try:
-        r = requests.post(
-            endpoint,
-            data=query,
-            headers={
-                "Content-Type":"application/sparql-update",
-                "Accept":"application/json"
-            }
-        )
+        r = requests.post(endpoint, data=payload, headers=headers)
 
-        if r.status_code == 200 or r.status_code == 204:
-            print("Bulk insert successful")
+        if r.status_code in (200, 204):
+            print(f"Stream insert OK ({len(statements)} triples)")
+            
         else:
-            print("Insert failed:", r.status_code, r.text)  # <- show server response
-
+            print("Stream insert failed:", r.status_code, r.text)
+        time.sleep(0.1)  # slight delay to avoid overwhelming the server
     except Exception as e:
-        print("Insert error:", e)
+        print("Streaming insert error:", e)
 
 
+# -------------------------------------------------------------------------
+# BUFFERED INGESTION
+# -------------------------------------------------------------------------
+def add_to_buffer(triple, named_graph=None):
+    """
+    Push triple into ingestion queue (blocking if full).
+    This provides backpressure and guarantees no data loss.
+    """
+
+    s, p, o = triple
+
+    if named_graph:
+        line = f"{s.n3()} {p.n3()} {o.n3()} <{named_graph}> .\n"
+    else:
+        line = f"{s.n3()} {p.n3()} {o.n3()} .\n"
+
+    _ingest_queue.put(line)  # blocks if queue full → SAFE
+
+
+
+
+def buffer_flusher_daemon():
+    endpoint = "http://acb8computer:7200/repositories/test1/statements"
+    BATCH_SIZE = 500
+    MAX_RETRIES = 3
+
+    while True:
+        batch = []
+        try:
+            # Block until at least one item is available
+            line = _ingest_queue.get(timeout=1)
+            batch.append(line)
+
+            # Drain up to BATCH_SIZE without blocking
+            while len(batch) < BATCH_SIZE:
+                try:
+                    batch.append(_ingest_queue.get_nowait())
+                except queue.Empty:
+                    break
+
+            # Attempt POST with retries
+            payload = "".join(batch)
+            success = False
+
+            for attempt in range(MAX_RETRIES):
+                try:
+                    r = requests.post(
+                        endpoint,
+                        data=payload,
+                        headers={"Content-Type": "application/n-quads"},
+                        timeout=30
+                    )
+                    if r.status_code in (200, 204):
+                        success = True
+                        break
+                    else:
+                        print(f"[FLUSH ERROR] attempt {attempt+1}: {r.status_code} {r.text[:200]}")
+                except requests.RequestException as e:
+                    print(f"[FLUSH ERROR] attempt {attempt+1}: {e}")
+                time.sleep(0.5 * (attempt + 1))  # backoff
+
+            if not success:
+                # Log the lost triples so you can diagnose
+                print(f"[DATA LOSS] Failed to insert {len(batch)} triples after {MAX_RETRIES} retries")
+
+            # Always mark done — keeps join() unblocked
+            # Log failures above rather than silently swallowing
+            for _ in batch:
+                _ingest_queue.task_done()
+
+            time.sleep(0.05)
+
+        except queue.Empty:
+            # Queue idle — nothing to flush right now
+            pass
 # -------------------------------------------------------------------------
 # HARVEST EXECUTION
 # -------------------------------------------------------------------------
@@ -661,107 +926,79 @@ def harvest_endpoint_optimized(control_uri, bgp, named_graph):
 
     print("Harvesting:", control_uri)
 
-    local_repo = Graph()
     harvested = set()
-
     counts = {}
 
-    for i,pat in enumerate(bgp):
-
+    for i, pat in enumerate(bgp):
         counts[i] = get_pattern_count(
             control_uri,
             pat["subject"],
             pat["predicate"],
-            pat["object"]
+            pat["object"],
+            pat.get("graph"),       # None for TPF, graph IRI/var for QPF
         )
 
     remaining = list(range(len(bgp)))
-
     first = min(remaining, key=lambda i: counts[i])
     remaining.remove(first)
-
     execution_order = [first]
 
     while remaining:
-
         connected = [
             idx for idx in remaining
             if shares_variable(bgp[idx], [bgp[i] for i in execution_order])
         ]
-
-        if connected:
-            next_idx = min(connected, key=lambda i: counts[i])
-        else:
-            next_idx = min(remaining, key=lambda i: counts[i])
-
+        next_idx = min(connected if connected else remaining,
+                       key=lambda i: counts[i])
         execution_order.append(next_idx)
         remaining.remove(next_idx)
 
     print("Execution order:", execution_order)
 
     for idx in execution_order:
-
         pat = bgp[idx]
-
         print("Processing pattern", idx, pat)
 
-        required_vars = extract_vars_from_pattern(pat)
+        bindings = extract_upstream_bindings_graphdb(
+            idx, harvested, bgp, named_graph
+        )
 
-        bindings = extract_upstream_bindings(local_repo, idx, harvested, bgp)
-
-        # STRICT MODE BEHAVIOR
         if INDEXING_MODE:
+            required_vars = extract_vars_from_pattern(pat)
             if not bindings and required_vars and len(harvested) > 0:
                 print("Skipping pattern (strict mode, no bindings)")
                 harvested.add(idx)
                 continue
 
-        # NORMAL BEHAVIOR
-        if not bindings or not required_vars:
-
+        if not bindings or not extract_vars_from_pattern(pat):
             print("Full pattern download")
-
             url = tpf_uri_request_builder(
                 control_uri,
                 pat["subject"],
                 pat["predicate"],
-                pat["object"]
+                pat["object"],
+                pat.get("graph"),
             )
+            harvest_pattern_into_repo(
+            url,
+            named_graph,
+            pat["subject"],
+            pat["predicate"],
+            pat["object"])
 
-            harvest_pattern_into_repo(url, local_repo)
         else:
-
             print("Bind join:", len(bindings), "bindings")
-
             for i in range(0, len(bindings), BIND_BATCH_SIZE):
-                print(f"Processing binding batch {i} → {i+BIND_BATCH_SIZE}")
+                print(f"Processing binding batch {i} → {i + BIND_BATCH_SIZE}")
+                batch = bindings[i:i + BIND_BATCH_SIZE]
+                fetch_binding_batch(batch, pat, control_uri, named_graph)
 
-                batch = bindings[i:i+BIND_BATCH_SIZE]
-
-                fetch_binding_batch(batch, pat, control_uri, local_repo)
-
+        _ingest_queue.join()
+        print(f"[SYNC] Queue drained after pattern {idx}")
         harvested.add(idx)
-        print("Repo size after pattern", idx, ":", len(local_repo))
         print("------------------------------------")
 
-    if len(local_repo) > 0:
-
-        unique = set(local_repo)
-
-        if INDEXING_MODE:
-            print(f"[INDEXING MODE] Skipping insert. Triples collected: {len(unique)}")
-            return local_repo
-
-        print("Inserting", len(unique), "triples")
-
-        query = build_query(unique, named_graph)
-
-    else:
-
-        print("No triples harvested")
-
-        if INDEXING_MODE:
-            return local_repo
+    return None
 
 
 # -------------------------------------------------------------------------
@@ -769,7 +1006,7 @@ def harvest_endpoint_optimized(control_uri, bgp, named_graph):
 # -------------------------------------------------------------------------
 
 def FindBGPPriority(query, endpoints, base_named_graph=None):
-
+    threading.Thread(target=buffer_flusher_daemon, daemon=True).start()
     if isinstance(endpoints,str):
         endpoints = [endpoints]
 
@@ -777,15 +1014,13 @@ def FindBGPPriority(query, endpoints, base_named_graph=None):
         bgp = transform(query)
     except Exception as e:
         print("ERROR inside transform:", e)
-        return None
+        return
 
     if not bgp:
         print("No triple patterns extracted from query")
-        return None
+        return
 
     print("Query has", len(bgp), "triple patterns")
-
-    final_repo = Graph()
 
     for i,endpoint in enumerate(endpoints):
 
@@ -794,15 +1029,11 @@ def FindBGPPriority(query, endpoints, base_named_graph=None):
         if base_named_graph:
             graph_iri = f"{base_named_graph}/endpoint{i+1}"
 
-        repo = harvest_endpoint_optimized(endpoint, bgp, graph_iri)
-
-        if repo:
-            for triple in repo:
-                final_repo.add(triple)
-
+        harvest_endpoint_optimized(endpoint, bgp, graph_iri)
+    print("Waiting for ingestion queue to empty...")
+    _ingest_queue.join()
+    print("All data flushed.")
     print("All endpoints processed.")
-
-    return final_repo
 
 # -------------------------------------------------------------------------
 # EXECUTE SPARQL QUERY ON LOCAL GRAPHDB
@@ -846,29 +1077,39 @@ def execute_sparql_query(query):
 
         print("SPARQL execution error:", e)
         return None
-    
-def run_query_strict(query, endpoints):
+
+
+def run_query_strict(query, endpoints, base_named_graph="urn:tpf:temp"):
+    import uuid
+    run_id = str(uuid.uuid4())
+    graph_base = f"{base_named_graph}/{run_id}"
+
+    print(f"[run_query_strict] Using temporary graph: {graph_base}")
+
+    FindBGPPriority(query, endpoints, base_named_graph=graph_base)
+
+    # FIXED: filter to only THIS run's graphs, not the entire repository
+    wrapped_query = f"""
+    SELECT ?s ?p ?o WHERE {{
+      GRAPH ?g {{
+        ?s ?p ?o .
+      }}
+      FILTER(STRSTARTS(STR(?g), "{graph_base}/"))
+    }}
     """
-    Entry point for the indexer.
-    Enables strict mode:
-    - No partial bindings
-    - No GraphDB insert
-    - Returns local RDF graph
-    """
 
-    global INDEXING_MODE, ALLOW_PARTIAL
+    results = execute_sparql_query(wrapped_query)
 
-    INDEXING_MODE = True
-    ALLOW_PARTIAL = False
+    if not results:
+        return []
 
-    try:
-        repo = FindBGPPriority(
-            query,
-            endpoints,
-            base_named_graph=None
-        )
-    finally:
-        INDEXING_MODE = False
-        ALLOW_PARTIAL = True
+    triples = []
+    for row in results:
+        s = row.get("s")
+        p = row.get("p")
+        o = row.get("o")
+        if s and p and o:
+            triples.append((s, p, o))
 
-    return repo
+    print(f"[run_query_strict] Returned {len(triples)} triples")
+    return triples
